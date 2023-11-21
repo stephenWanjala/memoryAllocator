@@ -70,8 +70,7 @@ el_blockfoot_t *el_get_footer(el_blockhead_t *head) {
 // Compute the address of the head for the given foot, which is at a
 // lower address than the foot.
 el_blockhead_t *el_get_header(el_blockfoot_t *foot) {
-    size_t size = foot->size;
-    return (el_blockhead_t *)((char *)foot - size - sizeof(el_blockhead_t));
+    return PTR_MINUS_BYTES(foot, sizeof(el_blockhead_t) + foot->size);
 }
 
 // Return a pointer to the block that is one block higher in memory
@@ -97,16 +96,10 @@ el_blockhead_t *el_block_above(el_blockhead_t *block) {
 // WARNING: This function must perform slightly different arithmetic
 // than el_block_above(). Take care when implementing it.
 el_blockhead_t *el_block_below(el_blockhead_t *block) {
-    if (block == el_ctl.avail->beg || block == el_ctl.used->beg) {
-        return NULL;  // Cannot go below the beginning of the heap
-    }
-
-    el_blockfoot_t *footer = PTR_MINUS_BYTES(block, sizeof(el_blockfoot_t));
-    size_t size = footer->size;
-
+    el_blockfoot_t *prevFoot = PTR_MINUS_BYTES(block, sizeof(el_blockfoot_t));
+    size_t size = prevFoot->size;
     return PTR_MINUS_BYTES(block, size + EL_BLOCK_OVERHEAD);
 }
-
 
 // Block list operations
 
@@ -189,33 +182,24 @@ void el_init_blocklist(el_blocklist_t *list) {
 // within list. Length is incremented and the bytes for the list are
 // updated to include the new block's size and its overhead.
 void el_add_block_front(el_blocklist_t *list, el_blockhead_t *block) {
-    el_blockhead_t *first = list->beg->next;
-
-    block->next = first;
+    block->next = list->beg->next;
     block->prev = list->beg;
+    list->beg->next->prev = block;
     list->beg->next = block;
-    first->prev = block;
-
     list->length++;
-    list->bytes += block->size + EL_BLOCK_OVERHEAD;
+    list->bytes += EL_BLOCK_OVERHEAD + block->size;
 }
-
 
 // TODO
 // Unlink block from the specified list.
 // Updates the length and bytes for that list including
 // the EL_BLOCK_OVERHEAD bytes associated with header/footer.
 void el_remove_block(el_blocklist_t *list, el_blockhead_t *block) {
-    el_blockhead_t *prev = block->prev;
-    el_blockhead_t *next = block->next;
-
-    prev->next = next;
-    next->prev = prev;
-
+    block->prev->next = block->next;
+    block->next->prev = block->prev;
     list->length--;
-    list->bytes -= (block->size + EL_BLOCK_OVERHEAD);
+    list->bytes -= EL_BLOCK_OVERHEAD + block->size;
 }
-
 
 // Allocation-related functions
 
@@ -248,30 +232,25 @@ el_blockhead_t *el_find_first_avail(size_t size) {
 // returns NULL.
 el_blockhead_t *el_split_block(el_blockhead_t *block, size_t new_size) {
     if (block->size < new_size + EL_BLOCK_OVERHEAD) {
-        return NULL;  // Not enough space for a split
+        return NULL; // Not enough space to split
     }
 
     size_t remaining_size = block->size - new_size - EL_BLOCK_OVERHEAD;
 
-    // Create a new block above the current block
-    el_blockhead_t *new_block = PTR_PLUS_BYTES(block, new_size + EL_BLOCK_OVERHEAD);
+    // Update the size of the original block
+    block->size = new_size;
+
+    // Create a new block above the original one
+    el_blockhead_t *new_block = PTR_PLUS_BYTES(block, block->size + EL_BLOCK_OVERHEAD);
     new_block->size = remaining_size;
     new_block->state = EL_AVAILABLE;
 
-    // Create a footer for the new block
-    el_blockfoot_t *new_block_footer = el_get_footer(new_block);
-    new_block_footer->size = remaining_size;
-
-    // Update the current block size
-    block->size = new_size;
-
-    // Update the footer of the current block
-    el_blockfoot_t *block_footer = el_get_footer(block);
-    block_footer->size = new_size;
+    // Update the footer of the new block
+    el_blockfoot_t *new_foot = el_get_footer(new_block);
+    new_foot->size = remaining_size;
 
     return new_block;
 }
-
 
 // TODO
 // Return pointer to a block of memory with at least the given size
@@ -282,24 +261,23 @@ el_blockhead_t *el_split_block(el_blockhead_t *block, size_t new_size) {
 void *el_malloc(size_t nbytes) {
     el_blockhead_t *block = el_find_first_avail(nbytes);
     if (block == NULL) {
-        return NULL;  // No suitable block found
+        return NULL; // No available block of sufficient size
     }
 
     el_blockhead_t *new_block = el_split_block(block, nbytes);
     if (new_block == NULL) {
-        return NULL;  // Splitting failed
+        return NULL; // Splitting failed
     }
 
+    // Remove the original block from the available list
     el_remove_block(el_ctl.avail, block);
+
+    // Add the new block to the used list
     el_add_block_front(el_ctl.used, new_block);
 
-    // After allocation, check if there's space to merge with the next available block
-    el_merge_block_with_above(new_block);
-
-    return (void *)(new_block + 1);  // Return pointer to usable space
+    // Return the pointer to the usable space
+    return PTR_PLUS_BYTES(new_block, sizeof(el_blockhead_t));
 }
-
-
 
 // De-allocation/free() related functions
 
@@ -314,28 +292,26 @@ void *el_malloc(size_t nbytes) {
 // indicate the two blocks are merged. Removes both lower and higher from the
 // available list and re-adds lower to the front of the available list.
 void el_merge_block_with_above(el_blockhead_t *lower) {
-    if (lower == NULL || lower->state != EL_AVAILABLE) {
-        return;  // Nothing to merge
-    }
-
     el_blockhead_t *higher = el_block_above(lower);
-    if (higher == NULL || higher->state != EL_AVAILABLE) {
-        return;  // No available block above to merge with
+
+    if (lower == NULL || lower->state != EL_AVAILABLE || higher == NULL || higher->state != EL_AVAILABLE) {
+        return; // Cannot merge
     }
 
-    // Merge the two blocks
+    // Remove both blocks from the available list
     el_remove_block(el_ctl.avail, lower);
     el_remove_block(el_ctl.avail, higher);
 
+    // Merge the two blocks
     lower->size += higher->size + EL_BLOCK_OVERHEAD;
 
-    el_blockfoot_t *foot = el_get_footer(lower);
-    foot->size = lower->size;
+    // Update the footer of the merged block
+    el_blockfoot_t *merged_foot = el_get_footer(lower);
+    merged_foot->size = lower->size;
 
+    // Add the merged block back to the available list
     el_add_block_front(el_ctl.avail, lower);
 }
-
-
 
 // TODO
 // Free the block pointed to by the given ptr. The area immediately
@@ -344,10 +320,15 @@ void el_merge_block_with_above(el_blockhead_t *lower) {
 // blocks using el_merge_block_with_above().
 void el_free(void *ptr) {
     if (ptr == NULL) {
-        return;  // Nothing to free
+        return; // Nothing to free
     }
 
-    el_blockhead_t *block = (el_blockhead_t *)ptr - 1;  // Move back to block header
+    // Convert the pointer to the block header
+    el_blockhead_t *block = PTR_MINUS_BYTES(ptr, sizeof(el_blockhead_t));
+
+    // Add the block to the available list
     el_add_block_front(el_ctl.avail, block);
+
+    // Attempt to merge with the block above
     el_merge_block_with_above(block);
 }
